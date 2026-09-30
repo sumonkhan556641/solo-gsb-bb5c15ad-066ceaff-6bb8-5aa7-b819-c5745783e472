@@ -11,6 +11,7 @@ from .schemas import (
     BatchCorrection,
     BatchIn,
     CleaningCorrection,
+    LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
     VerificationIn,
@@ -23,9 +24,10 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         title="食品换线放行服务",
         description=(
             "面向共用产线的生产批次过敏原换线放行：登记原料批号与批次、"
-            "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询。"
+            "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询；"
+            "支持原料批号待检锁定/解除与逐批出货资格版本联动出货核验单。"
         ),
-        version="1.0.0",
+        version="1.1.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -76,6 +78,20 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         """更正原料批号（名称/过敏原），重算受影响批次及后续批次。"""
         return service.correct_material_lot(lot_no, body.material, body.allergens)
 
+    @app.put("/api/material-lots/{lot_no}/lock", tags=["原料批号"])
+    def lock_material_lot(lot_no: str, body: LotLockIn, service: Service = Depends(svc)):
+        """原料批号待检锁定/解除：按批号设置 LOCKED/UNLOCKED 并填写原因。
+
+        重复提交相同状态不产生新变更；每次实际变化都使直接使用该批号的批次
+        出货资格版本递增并联动核验单。
+        """
+        return service.set_material_lot_lock(lot_no, body.lock_status, body.reason)
+
+    @app.get("/api/material-lots/{lot_no}/lock-history", tags=["原料批号"])
+    def material_lot_lock_history(lot_no: str, service: Service = Depends(svc)):
+        """查询原料批号当前锁定状态及历次锁定/解除变更。"""
+        return service.material_lot_lock_history(lot_no)
+
     # ---------------- 产线 ----------------
 
     @app.get("/api/lines", tags=["产线"])
@@ -122,6 +138,11 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def batch_history(batch_no: str, service: Service = Depends(svc)):
         """查询某批次历次裁决版本（可审计的历史裁决）。"""
         return service.batch_history(batch_no)
+
+    @app.get("/api/batches/{batch_no}/eligibility", tags=["批次"])
+    def batch_eligibility(batch_no: str, service: Service = Depends(svc)):
+        """逐批查询出货资格：当前可出货状态/出货资格版本/直接使用的锁定批号，及历次资格版本。"""
+        return service.batch_eligibility(batch_no)
 
     # ---------------- 出货核验单 ----------------
 

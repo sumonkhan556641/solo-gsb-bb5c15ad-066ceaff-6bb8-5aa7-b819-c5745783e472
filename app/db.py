@@ -24,8 +24,23 @@ CREATE TABLE IF NOT EXISTS material_lot (
     lot_no      TEXT PRIMARY KEY,
     material    TEXT NOT NULL,
     allergens   TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，过敏原代码
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    lock_status TEXT NOT NULL DEFAULT 'UNLOCKED',  -- UNLOCKED / LOCKED（待检锁定）
+    lock_reason TEXT,                        -- 最近一次锁定/解除原因（历史见 material_lot_lock_event）
+    locked_at   TEXT                         -- 最近一次锁定时间；解除后为 NULL
 );
+
+-- 原料批号锁定/解除历史（只追加；重复提交相同状态不写入）
+CREATE TABLE IF NOT EXISTS material_lot_lock_event (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_no       TEXT NOT NULL,
+    lock_status  TEXT NOT NULL,             -- LOCKED / UNLOCKED
+    reason       TEXT NOT NULL,
+    changed_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lock_event_lot
+    ON material_lot_lock_event(lot_no, id);
 
 CREATE TABLE IF NOT EXISTS line (
     line_id     TEXT PRIMARY KEY,
@@ -84,6 +99,31 @@ CREATE TABLE IF NOT EXISTS adjudication_version (
 CREATE INDEX IF NOT EXISTS idx_version_batch
     ON adjudication_version(batch_no, version);
 
+-- 每个批次当前出货资格（独立于过敏原裁决版本链；版本只在资格输入实际变化时递增）
+CREATE TABLE IF NOT EXISTS shipping_eligibility (
+    batch_no      TEXT PRIMARY KEY REFERENCES batch(batch_no),
+    version       INTEGER NOT NULL DEFAULT 0,
+    eligible      INTEGER NOT NULL,          -- 1=可出货；0=不可出货
+    locked_lots   TEXT NOT NULL DEFAULT '[]', -- JSON：该批直接使用且当前锁定的原料批号
+    reasons       TEXT NOT NULL DEFAULT '[]', -- JSON：资格判定原因条目
+    updated_at    TEXT NOT NULL
+);
+
+-- 出货资格历史版本（只追加，用于审计与逐批状态查询）
+CREATE TABLE IF NOT EXISTS shipping_eligibility_version (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no      TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    eligible      INTEGER NOT NULL,
+    locked_lots   TEXT NOT NULL DEFAULT '[]',
+    reasons       TEXT NOT NULL DEFAULT '[]',
+    trigger       TEXT NOT NULL,             -- REGISTER / LOT_LOCK / CORRECT_BATCH
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_elig_version_batch
+    ON shipping_eligibility_version(batch_no, version);
+
 -- 出货核验单：一张单据关联多个已登记生产批次，逐批保存裁决快照
 CREATE TABLE IF NOT EXISTS verification (
     verification_no  TEXT PRIMARY KEY,
@@ -93,7 +133,7 @@ CREATE TABLE IF NOT EXISTS verification (
     confirmed_at     TEXT
 );
 
--- 核验单逐批快照：创建/重新核验时记录当时的裁决版本与结论
+-- 核验单逐批快照：创建/重新核验时记录当时的裁决版本、出货资格版本与结论
 CREATE TABLE IF NOT EXISTS verification_batch (
     verification_no      TEXT NOT NULL REFERENCES verification(verification_no),
     batch_no             TEXT NOT NULL REFERENCES batch(batch_no),
@@ -103,6 +143,9 @@ CREATE TABLE IF NOT EXISTS verification_batch (
     snapshot_actual      TEXT NOT NULL DEFAULT '[]',
     snapshot_undeclared  TEXT NOT NULL DEFAULT '[]',
     snapshot_reasons     TEXT NOT NULL DEFAULT '[]',
+    snapshot_eligibility_version INTEGER NOT NULL DEFAULT 1,
+    snapshot_eligible    INTEGER NOT NULL DEFAULT 1,
+    snapshot_locked_lots TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (verification_no, batch_no)
 );
 
@@ -128,7 +171,10 @@ CREATE TABLE IF NOT EXISTS verification_confirmation_batch (
     snapshot_disposition TEXT NOT NULL,
     snapshot_actual      TEXT NOT NULL DEFAULT '[]',
     snapshot_undeclared  TEXT NOT NULL DEFAULT '[]',
-    snapshot_reasons     TEXT NOT NULL DEFAULT '[]'
+    snapshot_reasons     TEXT NOT NULL DEFAULT '[]',
+    snapshot_eligibility_version INTEGER NOT NULL DEFAULT 1,
+    snapshot_eligible    INTEGER NOT NULL DEFAULT 1,
+    snapshot_locked_lots TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_vcb_confirmation
@@ -215,6 +261,73 @@ class Store:
         return cur.fetchone()["n"] == 0
 
 
+def _table_columns(conn, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(conn) -> None:
+    """旧库就地升级：为既有表补齐新增列。
+
+    DDL 在 autocommit 状态执行；既有批次的出货资格 v1 回填在 initialize 的写事务内完成。
+    """
+
+    def add_column_if_missing(table: str, column: str, ddl: str) -> None:
+        cols = _table_columns(conn, table)
+        if not cols:
+            return  # 表尚未创建（全新库由 SCHEMA 直接建成含新列的形态）
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+    add_column_if_missing(
+        "material_lot", "lock_status", "lock_status TEXT NOT NULL DEFAULT 'UNLOCKED'"
+    )
+    add_column_if_missing("material_lot", "lock_reason", "lock_reason TEXT")
+    add_column_if_missing("material_lot", "locked_at", "locked_at TEXT")
+    add_column_if_missing(
+        "verification_batch",
+        "snapshot_eligibility_version",
+        "snapshot_eligibility_version INTEGER NOT NULL DEFAULT 1",
+    )
+    add_column_if_missing(
+        "verification_batch",
+        "snapshot_eligible",
+        "snapshot_eligible INTEGER NOT NULL DEFAULT 1",
+    )
+    add_column_if_missing(
+        "verification_batch",
+        "snapshot_locked_lots",
+        "snapshot_locked_lots TEXT NOT NULL DEFAULT '[]'",
+    )
+    add_column_if_missing(
+        "verification_confirmation_batch",
+        "snapshot_eligibility_version",
+        "snapshot_eligibility_version INTEGER NOT NULL DEFAULT 1",
+    )
+    add_column_if_missing(
+        "verification_confirmation_batch",
+        "snapshot_eligible",
+        "snapshot_eligible INTEGER NOT NULL DEFAULT 1",
+    )
+    add_column_if_missing(
+        "verification_confirmation_batch",
+        "snapshot_locked_lots",
+        "snapshot_locked_lots TEXT NOT NULL DEFAULT '[]'",
+    )
+
+
+def _backfill_batches(conn) -> list[str]:
+    """为缺少出货资格记录的既有批次补建 v1 资格（按当前裁决与锁定状态计算）。"""
+    missing = [
+        r["batch_no"]
+        for r in conn.execute(
+            """SELECT b.batch_no AS batch_no FROM batch b
+               LEFT JOIN shipping_eligibility se ON se.batch_no = b.batch_no
+               WHERE se.batch_no IS NULL"""
+        ).fetchall()
+    ]
+    return missing
+
+
 def initialize(store: Store, seed_demo: bool = False) -> None:
     """幂等初始化：建表、写入过敏原字典；全新库可附带演示原料批号。
 
@@ -229,11 +342,43 @@ def initialize(store: Store, seed_demo: bool = False) -> None:
     # DDL：autocommit 状态执行，IF NOT EXISTS 保证幂等；
     # 旧库升级时也必须执行，以便补齐后续版本新增的表。
     conn.executescript(SCHEMA)
+    _migrate(conn)
     with store.write():
         conn.executemany(
             "INSERT OR IGNORE INTO allergen(code, name_zh) VALUES (?, ?)",
             list(al.ALLERGENS.items()),
         )
+        # 既有批次回填出货资格 v1：按当前裁决与各批号当前锁定状态计算
+        for batch_no in _backfill_batches(conn):
+            now = datetime.now(UTC).isoformat()
+            adj = conn.execute(
+                "SELECT disposition FROM adjudication WHERE batch_no = ?", (batch_no,)
+            ).fetchone()
+            locked = [
+                r["lot_no"]
+                for r in conn.execute(
+                    """SELECT bm.lot_no AS lot_no FROM batch_material bm
+                       JOIN material_lot ml ON ml.lot_no = bm.lot_no
+                       WHERE bm.batch_no = ? AND ml.lock_status = 'LOCKED'
+                       ORDER BY bm.lot_no""",
+                    (batch_no,),
+                ).fetchall()
+            ]
+            disposition = adj["disposition"] if adj else "RELEASE"
+            eligible = 0 if locked or disposition != "RELEASE" else 1
+            reasons = dumps([])
+            conn.execute(
+                """INSERT INTO shipping_eligibility
+                   (batch_no, version, eligible, locked_lots, reasons, updated_at)
+                   VALUES (?, 1, ?, ?, ?, ?)""",
+                (batch_no, eligible, dumps(locked), reasons, now),
+            )
+            conn.execute(
+                """INSERT INTO shipping_eligibility_version
+                   (batch_no, version, eligible, locked_lots, reasons, trigger, updated_at)
+                   VALUES (?, 1, ?, ?, ?, 'REGISTER', ?)""",
+                (batch_no, eligible, dumps(locked), reasons, now),
+            )
         # 演示数据仅在全新空库写入；过敏原字典每次幂等补齐
         if seed_demo and fresh:
             now = datetime.now(UTC).isoformat()

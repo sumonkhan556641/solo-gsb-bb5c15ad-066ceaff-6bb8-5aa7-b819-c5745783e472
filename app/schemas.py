@@ -1,6 +1,8 @@
 """HTTP 请求模型。"""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -13,6 +15,13 @@ class MaterialLotIn(BaseModel):
 class MaterialLotCorrection(BaseModel):
     material: str | None = Field(None, description="更正后的原料名称；不传表示不变")
     allergens: list[str] | None = Field(None, description="更正后的过敏原代码全集；不传表示不变")
+
+
+class LotLockIn(BaseModel):
+    lock_status: Literal["LOCKED", "UNLOCKED"] = Field(
+        ..., description="目标状态：LOCKED=待检锁定，UNLOCKED=解除锁定"
+    )
+    reason: str = Field(..., min_length=1, description="锁定或解除原因（必填）")
 
 
 class BatchIn(BaseModel):
