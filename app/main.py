@@ -11,6 +11,7 @@ from .schemas import (
     BatchCorrection,
     BatchIn,
     CleaningCorrection,
+    LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
     VerificationIn,
@@ -76,6 +77,25 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         """更正原料批号（名称/过敏原），重算受影响批次及后续批次。"""
         return service.correct_material_lot(lot_no, body.material, body.allergens)
 
+    @app.post("/api/material-lots/{lot_no}/lock", tags=["原料批号待检锁定"])
+    def lock_material_lot(lot_no: str, body: LotLockIn, service: Service = Depends(svc)):
+        """原料批号出现待检风险时按批号锁定并填写原因。
+
+        未知批号 404、空原因 400；重复提交相同状态幂等无变化；
+        状态实际变化使所有直接使用该批号的批次出货资格版本递增。
+        """
+        return service.set_material_lot_lock(lot_no, True, body.reason)
+
+    @app.post("/api/material-lots/{lot_no}/unlock", tags=["原料批号待检锁定"])
+    def unlock_material_lot(lot_no: str, body: LotLockIn, service: Service = Depends(svc)):
+        """解除批号待检锁定并填写原因（同锁定的幂等与版本规则）。"""
+        return service.set_material_lot_lock(lot_no, False, body.reason)
+
+    @app.get("/api/material-lots/{lot_no}/lock", tags=["原料批号待检锁定"])
+    def get_material_lot_lock(lot_no: str, service: Service = Depends(svc)):
+        """查询批号当前锁定状态与历次锁定/解除变更。"""
+        return service.get_material_lot_lock(lot_no)
+
     # ---------------- 产线 ----------------
 
     @app.get("/api/lines", tags=["产线"])
@@ -122,6 +142,22 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def batch_history(batch_no: str, service: Service = Depends(svc)):
         """查询某批次历次裁决版本（可审计的历史裁决）。"""
         return service.batch_history(batch_no)
+
+    # ---------------- 出货资格（原料批号待检锁定） ----------------
+
+    @app.get("/api/batches/{batch_no}/eligibility", tags=["出货资格"])
+    def get_batch_eligibility(batch_no: str, service: Service = Depends(svc)):
+        """查询单批当前出货资格及历次版本（批号锁定状态决定）。"""
+        return service.get_shipment_eligibility(batch_no)
+
+    @app.get("/api/eligibilities", tags=["出货资格"])
+    def list_eligibilities(
+        line_id: str | None = None,
+        status: str | None = None,
+        service: Service = Depends(svc),
+    ):
+        """逐批列出出货资格，可按产线与 SHIPPABLE / BLOCKED 过滤。"""
+        return service.list_shipment_eligibility(line_id, status)
 
     # ---------------- 出货核验单 ----------------
 

@@ -253,17 +253,203 @@ def recompute_from(
     # （即使结论仍为 RELEASE）。草稿单不转态——其快照本就待重新核验时刷新。
     if summaries:
         batch_nos = [s["batch_no"] for s in summaries]
-        placeholders = ",".join("?" * len(batch_nos))
-        conn.execute(
-            f"""UPDATE verification SET status = 'PENDING_REVIEW', updated_at = ?
-                WHERE status = 'CONFIRMED' AND verification_no IN (
-                    SELECT DISTINCT verification_no FROM verification_batch
-                    WHERE batch_no IN ({placeholders})
-                )""",
-            [_now(), *batch_nos],
-        )
+        _flip_confirmed_verifications(conn, batch_nos)
 
     return summaries
+
+
+# ---------------------------------------------------------------- 出货资格
+
+
+SHIP_STATUSES = ("SHIPPABLE", "BLOCKED")
+
+
+def _locked_lots_for_batch(conn, batch_no: str) -> list[str]:
+    """该批“直接使用”且当前处于待检锁定的原料批号（不沿产线残留传递）。"""
+    rows = conn.execute(
+        """SELECT bm.lot_no AS lot_no FROM batch_material bm
+           JOIN material_lot_lock ml ON ml.lot_no = bm.lot_no
+           WHERE bm.batch_no = ? AND ml.locked = 1 ORDER BY bm.lot_no""",
+        (batch_no,),
+    ).fetchall()
+    return [r["lot_no"] for r in rows]
+
+
+def _ship_reasons(locked_lots: list[str]) -> list[dict[str, str]]:
+    if not locked_lots:
+        return [
+            {
+                "code": "SHIP_ELIGIBLE",
+                "message": "直接使用的原料批号均未处于待检锁定状态，具备出货资格。",
+            }
+        ]
+    return [
+        {
+            "code": "MATERIAL_LOT_LOCKED",
+            "lot_no": lot,
+            "message": f"直接使用的原料批号 {lot} 处于待检锁定状态，不得通过出货核验。",
+        }
+        for lot in locked_lots
+    ]
+
+
+def _compute_shipment(conn, batch_no: str) -> dict[str, Any]:
+    """按批号锁定现状计算一批的出货资格。"""
+    locked_lots = _locked_lots_for_batch(conn, batch_no)
+    return {
+        "status": "BLOCKED" if locked_lots else "SHIPPABLE",
+        "locked_lots": locked_lots,
+        "reasons": _ship_reasons(locked_lots),
+    }
+
+
+def _shipment_payload(row) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "version": row["version"],
+        "status": row["status"],
+        "locked_lots": loads(row["locked_lots"]),
+        "reasons": loads(row["reasons"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _get_shipment(conn, batch_no: str):
+    return conn.execute(
+        "SELECT * FROM shipment_eligibility WHERE batch_no = ?", (batch_no,)
+    ).fetchone()
+
+
+def _insert_shipment_version(
+    conn, batch_no: str, version: int, state: dict[str, Any], trigger: str, now: str
+) -> None:
+    conn.execute(
+        """INSERT INTO shipment_eligibility_version
+           (batch_no, version, status, locked_lots, reasons, trigger, changed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            batch_no,
+            version,
+            state["status"],
+            dumps(state["locked_lots"]),
+            dumps(state["reasons"]),
+            trigger,
+            now,
+        ),
+    )
+
+
+def _init_shipment(conn, batch_no: str, trigger: str = "REGISTER") -> dict[str, Any]:
+    """新登记批次：按当前锁定状态建立出货资格 v1（每个批次仅一次）。"""
+    now = _now()
+    state = _compute_shipment(conn, batch_no)
+    conn.execute(
+        """INSERT INTO shipment_eligibility
+           (batch_no, version, status, locked_lots, reasons, updated_at)
+           VALUES (?, 1, ?, ?, ?, ?)""",
+        (batch_no, state["status"], dumps(state["locked_lots"]), dumps(state["reasons"]), now),
+    )
+    _insert_shipment_version(conn, batch_no, 1, state, trigger, now)
+    return state
+
+
+def _advance_shipment(
+    conn,
+    batch_no: str,
+    trigger: str,
+    *,
+    force: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """重算一批出货资格。
+
+    状态（SHIPPABLE/BLOCKED）或锁定批号集合实际变化（或 force=True）时：
+    出货资格版本递增并追加历史；否则版本不变、不产生新变更。
+    返回 (当前资格, 本次是否递增)。
+    """
+    now = _now()
+    state = _compute_shipment(conn, batch_no)
+    row = _get_shipment(conn, batch_no)
+    if row is None:
+        state_init = _init_shipment(conn, batch_no, trigger=trigger)
+        return state_init, True
+
+    changed = force or (
+        state["status"] != row["status"]
+        or state["locked_lots"] != loads(row["locked_lots"])
+    )
+    if not changed:
+        return {
+            "status": row["status"],
+            "locked_lots": loads(row["locked_lots"]),
+            "reasons": loads(row["reasons"]),
+        }, False
+
+    new_version = row["version"] + 1
+    conn.execute(
+        """UPDATE shipment_eligibility
+           SET version=?, status=?, locked_lots=?, reasons=?, updated_at=?
+           WHERE batch_no=?""",
+        (
+            new_version,
+            state["status"],
+            dumps(state["locked_lots"]),
+            dumps(state["reasons"]),
+            now,
+            batch_no,
+        ),
+    )
+    _insert_shipment_version(conn, batch_no, new_version, state, trigger, now)
+    return state, True
+
+
+def _advance_shipment_for_lot(conn, lot_no: str, trigger: str) -> list[dict[str, Any]]:
+    """批号锁定状态实际变化：所有直接使用该批号的批次出货资格版本一律递增
+    （即使该批仍被其他锁定批号连带 BLOCKED、资格结论未翻转）。
+    """
+    rows = conn.execute(
+        """SELECT b.batch_no AS batch_no, b.line_id AS line_id, b.seq AS seq
+           FROM batch_material bm JOIN batch b ON b.batch_no = bm.batch_no
+           WHERE bm.lot_no = ? ORDER BY b.line_id, b.seq""",
+        (lot_no,),
+    ).fetchall()
+    affected = []
+    for r in rows:
+        state, _changed = _advance_shipment(
+            conn, r["batch_no"], trigger, force=True
+        )
+        ship = _get_shipment(conn, r["batch_no"])
+        affected.append(
+            {
+                "batch_no": r["batch_no"],
+                "line_id": r["line_id"],
+                "seq": r["seq"],
+                "version": ship["version"],
+                "status": state["status"],
+                "locked_lots": state["locked_lots"],
+            }
+        )
+    if affected:
+        _flip_confirmed_verifications(conn, [a["batch_no"] for a in affected])
+    return affected
+
+
+def _flip_confirmed_verifications(conn, batch_nos: list[str]) -> None:
+    """所含批次的裁决版本或出货资格版本发生变化的“已确认”核验单立即转待复核。
+
+    草稿/待复核单据不转态——其快照本就待重新核验时刷新。
+    """
+    if not batch_nos:
+        return
+    placeholders = ",".join("?" * len(batch_nos))
+    conn.execute(
+        f"""UPDATE verification SET status = 'PENDING_REVIEW', updated_at = ?
+            WHERE status = 'CONFIRMED' AND verification_no IN (
+                SELECT DISTINCT verification_no FROM verification_batch
+                WHERE batch_no IN ({placeholders})
+            )""",
+        [_now(), *batch_nos],
+    )
 
 
 # ---------------------------------------------------------------- 序列化
@@ -273,6 +459,7 @@ def _batch_full(conn, row) -> dict[str, Any]:
     adj = conn.execute(
         "SELECT * FROM adjudication WHERE batch_no = ?", (row["batch_no"],)
     ).fetchone()
+    ship = _get_shipment(conn, row["batch_no"])
     return {
         "batch_no": row["batch_no"],
         "line_id": row["line_id"],
@@ -282,6 +469,7 @@ def _batch_full(conn, row) -> dict[str, Any]:
         "cleaned_allergens": loads(row["cleaned"]),
         "created_at": row["created_at"],
         "adjudication": _adj_payload(adj) if adj else None,
+        "shipment_eligibility": _shipment_payload(ship),
     }
 
 
@@ -337,25 +525,12 @@ class Service:
             ).fetchone()
             if not row:
                 raise not_found("MATERIAL_LOT_NOT_FOUND", f"原料批号不存在: {lot_no}")
-            return {
-                "lot_no": row["lot_no"],
-                "material": row["material"],
-                "allergens": loads(row["allergens"]),
-                "updated_at": row["updated_at"],
-            }
+            return _material_lot_payload(conn, row)
 
     def list_material_lots(self) -> list[dict[str, Any]]:
         with self.store.read() as conn:
             rows = conn.execute("SELECT * FROM material_lot ORDER BY lot_no").fetchall()
-            return [
-                {
-                    "lot_no": r["lot_no"],
-                    "material": r["material"],
-                    "allergens": loads(r["allergens"]),
-                    "updated_at": r["updated_at"],
-                }
-                for r in rows
-            ]
+            return [_material_lot_payload(conn, r) for r in rows]
 
     def correct_material_lot(
         self, lot_no: str, material: str | None, allergens: list[str] | None
@@ -410,6 +585,98 @@ class Service:
             "recomputed": recomputed,
             "affected_verifications": affected,
         }
+
+    # ---- 原料批号待检锁定 ----
+
+    def set_material_lot_lock(
+        self, lot_no: str, locked: bool, reason: str
+    ) -> dict[str, Any]:
+        """锁定/解除原料批号待检状态并填写原因。
+
+        - 未知批号拒绝（404）；原因空白拒绝（400）。
+        - 重复提交相同状态：不产生新变更（锁定版本/出货资格版本均不递增），
+          返回当前状态与 changed=false。
+        - 状态实际变化：锁定版本递增并追加历史；所有“直接使用”该批号的批次
+          出货资格版本一律递增；已确认核验单自动转待复核。
+        """
+        lot_no = (lot_no or "").strip()
+        reason = (reason or "").strip()
+        if not reason:
+            raise bad_request(
+                "INVALID_PAYLOAD", "reason 不能为空：锁定/解除必须填写原因"
+            )
+        with self.store.write() as conn:
+            lot = conn.execute(
+                "SELECT lot_no FROM material_lot WHERE lot_no = ?", (lot_no,)
+            ).fetchone()
+            if not lot:
+                raise not_found("MATERIAL_LOT_NOT_FOUND", f"原料批号不存在: {lot_no}")
+
+            row = conn.execute(
+                "SELECT * FROM material_lot_lock WHERE lot_no = ?", (lot_no,)
+            ).fetchone()
+            already = (row["locked"] == 1) if row else False
+            # 重复提交相同状态（含对从未锁定批号提交解除）：幂等无变化
+            if already == locked:
+                return {
+                    "lot_no": lot_no,
+                    "locked": already,
+                    "changed": False,
+                    "reason": row["reason"] if row else None,
+                    "lock_version": row["version"] if row else 0,
+                    "updated_at": row["updated_at"] if row else None,
+                    "affected_batches": [],
+                    "affected_verifications": [],
+                }
+
+            now = _now()
+            new_version = (row["version"] if row else 0) + 1
+            action = "LOCK" if locked else "UNLOCK"
+            if row:
+                conn.execute(
+                    """UPDATE material_lot_lock
+                       SET locked=?, reason=?, version=?, updated_at=? WHERE lot_no=?""",
+                    (1 if locked else 0, reason, new_version, now, lot_no),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO material_lot_lock
+                       (lot_no, locked, reason, version, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (lot_no, 1 if locked else 0, reason, new_version, now),
+                )
+            conn.execute(
+                """INSERT INTO material_lot_lock_version
+                   (lot_no, version, locked, action, reason, changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (lot_no, new_version, 1 if locked else 0, action, reason, now),
+            )
+
+            trigger = "LOT_LOCK" if locked else "LOT_UNLOCK"
+            affected_batches = _advance_shipment_for_lot(conn, lot_no, trigger)
+            affected = _affected_verifications(
+                conn, [a["batch_no"] for a in affected_batches]
+            )
+            return {
+                "lot_no": lot_no,
+                "locked": locked,
+                "changed": True,
+                "reason": reason,
+                "lock_version": new_version,
+                "updated_at": now,
+                "affected_batches": affected_batches,
+                "affected_verifications": affected,
+            }
+
+    def get_material_lot_lock(self, lot_no: str) -> dict[str, Any]:
+        """查询批号当前锁定状态与历次状态变更（未锁定过的批号历史为空）。"""
+        with self.store.read() as conn:
+            lot = conn.execute(
+                "SELECT lot_no FROM material_lot WHERE lot_no = ?", (lot_no,)
+            ).fetchone()
+            if not lot:
+                raise not_found("MATERIAL_LOT_NOT_FOUND", f"原料批号不存在: {lot_no}")
+            return _lot_lock_payload(conn, lot_no)
 
     # ---- 产线 ----
 
@@ -489,6 +756,8 @@ class Service:
             )
 
             recompute_from(conn, line_id, seq, "REGISTER")
+            # 新登记批次按当前批号锁定状态确定出货资格 v1
+            _init_shipment(conn, batch_no, "REGISTER")
             full = _batch_full(
                 conn,
                 conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone(),
@@ -566,7 +835,22 @@ class Service:
             )
 
             recomputed = recompute_from(conn, row["line_id"], row["seq"], "CORRECT_BATCH")
-            affected = _affected_verifications(conn, [s["batch_no"] for s in recomputed])
+
+            # 更正用料可能改变出货资格：仅本批直接用料发生变化；资格实际变化才递增，
+            # 并联动将所含批次的已确认核验单转待复核。
+            ship_state, ship_changed = _advance_shipment(
+                conn, batch_no, "CORRECT_BATCH"
+            )
+            if ship_changed:
+                _flip_confirmed_verifications(conn, [batch_no])
+
+            affected = _affected_verifications(
+                conn,
+                sorted(
+                    {s["batch_no"] for s in recomputed}
+                    | ({batch_no} if ship_changed else set())
+                ),
+            )
             full = _batch_full(
                 conn,
                 conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone(),
@@ -575,6 +859,12 @@ class Service:
         return {
             "corrected": full,
             "recomputed": recomputed,
+            "shipment_eligibility": {
+                "changed": ship_changed,
+                "version": full["shipment_eligibility"]["version"],
+                "status": ship_state["status"],
+                "locked_lots": ship_state["locked_lots"],
+            },
             "affected_verifications": affected,
         }
 
@@ -609,6 +899,46 @@ class Service:
                     for v in versions
                 ],
             }
+
+    # ---- 出货资格 ----
+
+    def get_shipment_eligibility(self, batch_no: str) -> dict[str, Any]:
+        """查询单批当前出货资格及其历次版本。"""
+        with self.store.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone()
+            if not row:
+                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            return _eligibility_payload(conn, row)
+
+    def list_shipment_eligibility(
+        self, line_id: str | None = None, status: str | None = None
+    ) -> dict[str, Any]:
+        """逐批列出出货资格（可按产线 / SHIPPABLE / BLOCKED 过滤）。"""
+        if status is not None:
+            status = status.strip().upper()
+            if status not in SHIP_STATUSES:
+                raise bad_request(
+                    "INVALID_PAYLOAD",
+                    f"status 必须是 {', '.join(SHIP_STATUSES)} 之一",
+                )
+        with self.store.read() as conn:
+            sql = """SELECT b.* FROM batch b
+                     JOIN shipment_eligibility se ON se.batch_no = b.batch_no"""
+            params: list[Any] = []
+            where = []
+            if line_id:
+                where.append("b.line_id = ?")
+                params.append(line_id)
+            if status:
+                where.append("se.status = ?")
+                params.append(status)
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY b.line_id, b.seq"
+            rows = conn.execute(sql, params).fetchall()
+            return {"eligibilities": [_eligibility_payload(conn, r) for r in rows]}
 
     # ---- 出货核验单 ----
 
@@ -735,10 +1065,12 @@ class Service:
             return _verification_payload(conn, row)
 
     def confirm_verification(self, verification_no: str) -> dict[str, Any]:
-        """原子确认：逐批快照版本须仍是当前版本，且快照结论全部为 RELEASE。
+        """原子确认：同时核对三项——逐批裁决版本、出货资格版本与批号当前锁定状态。
 
-        任一不符：返回全部不符批次及原因，单据保持未确认（不写入确认记录）。
-        HOLD 批次始终不能确认。
+        裁决：快照版本须仍为当前版本，且裁决结论全部为 RELEASE；
+        出货：快照出货资格版本须仍为当前版本，且当前没有直接使用的待检锁定批号。
+        任一不符：返回全部不符批次及原因，整单不确认（不写入确认记录）。
+        HOLD 批次始终不能确认；锁定期间即使过敏原裁决为 RELEASE 也不得通过。
         """
         with self.store.write() as conn:
             row = conn.execute(
@@ -777,7 +1109,7 @@ class Service:
                             "batch_no": b["batch_no"],
                             "reason_code": "STALE_SNAPSHOT",
                             "message": (
-                                f"快照版本 v{snapshot['version']} 已不是当前版本 "
+                                f"快照裁决版本 v{snapshot['version']} 已不是当前版本 "
                                 f"v{current['version']}，请先重新核验"
                             ),
                             "snapshot_version": snapshot["version"],
@@ -801,6 +1133,69 @@ class Service:
                         }
                     )
 
+                # 出货资格核对：快照出货资格版本须当前，且当前无直接使用的锁定批号
+                ship_snap = b["shipment_snapshot"]
+                ship_cur = b["shipment_current"]
+                if ship_snap is None or ship_cur is None:
+                    mismatches.append(
+                        {
+                            "batch_no": b["batch_no"],
+                            "reason_code": "STALE_ELIGIBILITY",
+                            "message": (
+                                "核验单缺少出货资格版本快照（旧版单据），请先重新核验"
+                            ),
+                            "snapshot_version": None,
+                            "current_version": None if ship_cur is None else ship_cur["version"],
+                            "change_reasons": b["shipment_change_reasons"],
+                        }
+                    )
+                    if ship_cur is not None and ship_cur["status"] != "SHIPPABLE":
+                        mismatches.append(
+                            {
+                                "batch_no": b["batch_no"],
+                                "reason_code": "MATERIAL_LOT_LOCKED",
+                                "message": (
+                                    f"批次直接使用的原料批号 {('、'.join(ship_cur['locked_lots']))} "
+                                    "处于待检锁定状态，即使过敏原裁决为 RELEASE 也不得通过出货核验"
+                                ),
+                                "snapshot_version": None,
+                                "current_version": ship_cur["version"],
+                                "locked_lots": ship_cur["locked_lots"],
+                            }
+                        )
+                    continue
+
+                ship_stale = ship_cur["version"] != ship_snap["version"]
+                locked = ship_cur["status"] != "SHIPPABLE"
+                if ship_stale:
+                    mismatches.append(
+                        {
+                            "batch_no": b["batch_no"],
+                            "reason_code": "STALE_ELIGIBILITY",
+                            "message": (
+                                f"快照出货资格版本 v{ship_snap['version']} 已不是当前版本 "
+                                f"v{ship_cur['version']}，请先重新核验"
+                            ),
+                            "snapshot_version": ship_snap["version"],
+                            "current_version": ship_cur["version"],
+                            "change_reasons": b["shipment_change_reasons"],
+                        }
+                    )
+                if locked:
+                    mismatches.append(
+                        {
+                            "batch_no": b["batch_no"],
+                            "reason_code": "MATERIAL_LOT_LOCKED",
+                            "message": (
+                                f"批次直接使用的原料批号 {('、'.join(ship_cur['locked_lots']))} "
+                                "处于待检锁定状态，即使过敏原裁决为 RELEASE 也不得通过出货核验"
+                            ),
+                            "snapshot_version": ship_snap["version"],
+                            "current_version": ship_cur["version"],
+                            "locked_lots": ship_cur["locked_lots"],
+                        }
+                    )
+
             if mismatches:
                 raise unprocessable(
                     "VERIFICATION_NOT_CONFIRMABLE",
@@ -817,15 +1212,18 @@ class Service:
             snapshot_rows = conn.execute(
                 """SELECT verification_no, position, batch_no, snapshot_version,
                           snapshot_disposition, snapshot_actual, snapshot_undeclared,
-                          snapshot_reasons
+                          snapshot_reasons, snapshot_ship_version, snapshot_ship_status,
+                          snapshot_locked_lots, snapshot_ship_reasons
                    FROM verification_batch WHERE verification_no = ? ORDER BY position""",
                 (verification_no,),
             ).fetchall()
             conn.executemany(
                 """INSERT INTO verification_confirmation_batch
                    (confirmation_id, verification_no, position, batch_no, snapshot_version,
-                    snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    snapshot_disposition, snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                    snapshot_ship_version, snapshot_ship_status,
+                    snapshot_locked_lots, snapshot_ship_reasons)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         confirmation_id,
@@ -837,6 +1235,10 @@ class Service:
                         sr["snapshot_actual"],
                         sr["snapshot_undeclared"],
                         sr["snapshot_reasons"],
+                        sr["snapshot_ship_version"],
+                        sr["snapshot_ship_status"],
+                        sr["snapshot_locked_lots"],
+                        sr["snapshot_ship_reasons"],
                     )
                     for sr in snapshot_rows
                 ],
@@ -861,11 +1263,113 @@ _TRIGGER_LABELS = {
     "REGISTER": "登记批次时裁决",
     "CORRECT_BATCH": "批次更正重算",
     "CORRECT_LOT": "原料批号更正重算",
+    "LOT_LOCK": "原料批号待检锁定",
+    "LOT_UNLOCK": "原料批号解除待检锁定",
+    "UPGRADE_INIT": "旧库升级初始资格",
+}
+
+_SHIP_TRIGGER_LABELS = {
+    "REGISTER": "登记批次时确定出货资格",
+    "CORRECT_BATCH": "批次用料更正重算出货资格",
+    "LOT_LOCK": "原料批号待检锁定",
+    "LOT_UNLOCK": "原料批号解除待检锁定",
+    "UPGRADE_INIT": "旧库升级初始资格",
 }
 
 
 def _trigger_label(trigger: str) -> str:
     return _TRIGGER_LABELS.get(trigger, trigger)
+
+
+def _ship_trigger_label(trigger: str) -> str:
+    return _SHIP_TRIGGER_LABELS.get(trigger, trigger)
+
+
+def _material_lot_payload(conn, row) -> dict[str, Any]:
+    lock = conn.execute(
+        "SELECT * FROM material_lot_lock WHERE lot_no = ?", (row["lot_no"],)
+    ).fetchone()
+    return {
+        "lot_no": row["lot_no"],
+        "material": row["material"],
+        "allergens": loads(row["allergens"]),
+        "updated_at": row["updated_at"],
+        "lock": _lock_state_payload(lock),
+    }
+
+
+def _lock_state_payload(lock) -> dict[str, Any]:
+    """material_lot_lock 行 -> 状态负载；无记录即从未锁定（UNLOCKED, version 0）。"""
+    if lock is None:
+        return {
+            "locked": False,
+            "status": "UNLOCKED",
+            "reason": None,
+            "version": 0,
+            "updated_at": None,
+        }
+    return {
+        "locked": lock["locked"] == 1,
+        "status": "LOCKED" if lock["locked"] == 1 else "UNLOCKED",
+        "reason": lock["reason"],
+        "version": lock["version"],
+        "updated_at": lock["updated_at"],
+    }
+
+
+def _lot_lock_payload(conn, lot_no: str) -> dict[str, Any]:
+    lock = conn.execute(
+        "SELECT * FROM material_lot_lock WHERE lot_no = ?", (lot_no,)
+    ).fetchone()
+    versions = conn.execute(
+        """SELECT version, locked, action, reason, changed_at
+           FROM material_lot_lock_version WHERE lot_no = ? ORDER BY version""",
+        (lot_no,),
+    ).fetchall()
+    return {
+        "lot_no": lot_no,
+        "lock": _lock_state_payload(lock),
+        "history": [
+            {
+                "version": v["version"],
+                "locked": v["locked"] == 1,
+                "action": v["action"],
+                "reason": v["reason"],
+                "changed_at": v["changed_at"],
+            }
+            for v in versions
+        ],
+    }
+
+
+def _eligibility_payload(conn, batch_row) -> dict[str, Any]:
+    se = conn.execute(
+        "SELECT * FROM shipment_eligibility WHERE batch_no = ?",
+        (batch_row["batch_no"],),
+    ).fetchone()
+    versions = conn.execute(
+        """SELECT version, status, locked_lots, reasons, trigger, changed_at
+           FROM shipment_eligibility_version
+           WHERE batch_no = ? ORDER BY version""",
+        (batch_row["batch_no"],),
+    ).fetchall()
+    return {
+        "batch_no": batch_row["batch_no"],
+        "line_id": batch_row["line_id"],
+        "seq": batch_row["seq"],
+        "eligibility": _shipment_payload(se),
+        "history": [
+            {
+                "version": v["version"],
+                "status": v["status"],
+                "locked_lots": loads(v["locked_lots"]),
+                "reasons": loads(v["reasons"]),
+                "trigger": v["trigger"],
+                "changed_at": v["changed_at"],
+            }
+            for v in versions
+        ],
+    }
 
 
 def _affected_verifications(conn, batch_nos: list[str]) -> list[dict[str, Any]]:
@@ -912,8 +1416,50 @@ def _change_reasons(conn, batch_no: str, snapshot_version: int) -> list[dict[str
     ]
 
 
+def _shipment_change_reasons(conn, batch_no: str, snapshot_version) -> list[dict[str, Any]]:
+    """快照出货资格版本之后产生的版本即“变化”，逐条给出原因。
+
+    旧库升级前创建的单据快照版本为 NULL：返回一条升级提示。
+    """
+    if snapshot_version is None:
+        return [
+            {
+                "code": "SHIP_ELIGIBILITY_VERSION_CHANGED",
+                "message": "核验单创建时尚未记录出货资格版本，请重新核验以刷新出货资格快照",
+                "from_version": None,
+                "to_version": None,
+                "trigger": "UPGRADE_INIT",
+                "changed_at": None,
+            }
+        ]
+    rows = conn.execute(
+        """SELECT version, status, locked_lots, trigger, changed_at
+           FROM shipment_eligibility_version
+           WHERE batch_no = ? AND version > ? ORDER BY version""",
+        (batch_no, snapshot_version),
+    ).fetchall()
+    reasons = []
+    for idx, r in enumerate(rows):
+        locked = loads(r["locked_lots"])
+        locked_text = ("，锁定批号: " + "、".join(locked)) if locked else ""
+        reasons.append(
+            {
+                "code": "SHIP_ELIGIBILITY_VERSION_CHANGED",
+                "message": (
+                    f"出货资格版本 v{r['version']}（{_ship_trigger_label(r['trigger'])}）"
+                    f"晚于快照版本 v{snapshot_version}，资格 {r['status']}{locked_text}"
+                ),
+                "from_version": snapshot_version if idx == 0 else rows[idx - 1]["version"],
+                "to_version": r["version"],
+                "trigger": r["trigger"],
+                "changed_at": r["changed_at"],
+            }
+        )
+    return reasons
+
+
 def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
-    """组装逐批记录：快照版本、当前版本、当前结论与变化原因。"""
+    """组装逐批记录：裁决/出货资格快照版本、当前版本、当前结论与变化原因。"""
     rows = conn.execute(
         """SELECT vb.position AS position, vb.batch_no AS batch_no,
                   vb.snapshot_version AS snapshot_version,
@@ -921,19 +1467,63 @@ def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
                   vb.snapshot_actual AS snapshot_actual,
                   vb.snapshot_undeclared AS snapshot_undeclared,
                   vb.snapshot_reasons AS snapshot_reasons,
+                  vb.snapshot_ship_version AS snapshot_ship_version,
+                  vb.snapshot_ship_status AS snapshot_ship_status,
+                  vb.snapshot_locked_lots AS snapshot_locked_lots,
+                  vb.snapshot_ship_reasons AS snapshot_ship_reasons,
                   b.line_id AS line_id, b.seq AS seq,
                   a.version AS current_version, a.disposition AS current_disposition,
                   a.actual AS current_actual, a.undeclared AS current_undeclared,
-                  a.reasons AS current_reasons, a.decided_at AS current_decided_at
+                  a.reasons AS current_reasons, a.decided_at AS current_decided_at,
+                  se.version AS current_ship_version, se.status AS current_ship_status,
+                  se.locked_lots AS current_locked_lots,
+                  se.reasons AS current_ship_reasons, se.updated_at AS current_ship_updated_at
            FROM verification_batch vb
            JOIN batch b ON b.batch_no = vb.batch_no
            LEFT JOIN adjudication a ON a.batch_no = vb.batch_no
+           LEFT JOIN shipment_eligibility se ON se.batch_no = vb.batch_no
            WHERE vb.verification_no = ?
            ORDER BY vb.position""",
         (verification_no,),
     ).fetchall()
     batches = []
     for r in rows:
+        adj_current = None
+        if r["current_version"] is not None:
+            adj_current = {
+                "version": r["current_version"],
+                "disposition": r["current_disposition"],
+                "actual_allergens": loads(r["current_actual"]),
+                "undeclared_allergens": loads(r["current_undeclared"]),
+                "reasons": loads(r["current_reasons"]),
+                "decided_at": r["current_decided_at"],
+            }
+        ship_snapshot = None
+        if r["snapshot_ship_version"] is not None:
+            ship_snapshot = {
+                "version": r["snapshot_ship_version"],
+                "status": r["snapshot_ship_status"],
+                "locked_lots": loads(r["snapshot_locked_lots"]),
+                "reasons": loads(r["snapshot_ship_reasons"]),
+            }
+        ship_current = None
+        if r["current_ship_version"] is not None:
+            ship_current = {
+                "version": r["current_ship_version"],
+                "status": r["current_ship_status"],
+                "locked_lots": loads(r["current_locked_lots"]),
+                "reasons": loads(r["current_ship_reasons"]),
+                "updated_at": r["current_ship_updated_at"],
+            }
+        adj_changed = (
+            r["current_version"] is not None
+            and r["current_version"] != r["snapshot_version"]
+        )
+        ship_changed = (
+            r["current_ship_version"] is None
+            or r["snapshot_ship_version"] is None
+            or r["current_ship_version"] != r["snapshot_ship_version"]
+        )
         batches.append(
             {
                 "position": r["position"],
@@ -947,19 +1537,15 @@ def _verification_batches(conn, verification_no: str) -> list[dict[str, Any]]:
                     "undeclared_allergens": loads(r["snapshot_undeclared"]),
                     "reasons": loads(r["snapshot_reasons"]),
                 },
-                "current": None
-                if r["current_version"] is None
-                else {
-                    "version": r["current_version"],
-                    "disposition": r["current_disposition"],
-                    "actual_allergens": loads(r["current_actual"]),
-                    "undeclared_allergens": loads(r["current_undeclared"]),
-                    "reasons": loads(r["current_reasons"]),
-                    "decided_at": r["current_decided_at"],
-                },
-                "changed": r["current_version"] is not None
-                and r["current_version"] != r["snapshot_version"],
+                "current": adj_current,
+                "changed": adj_changed,
                 "change_reasons": _change_reasons(conn, r["batch_no"], r["snapshot_version"]),
+                "shipment_snapshot": ship_snapshot,
+                "shipment_current": ship_current,
+                "shipment_changed": ship_changed,
+                "shipment_change_reasons": _shipment_change_reasons(
+                    conn, r["batch_no"], r["snapshot_ship_version"]
+                ),
             }
         )
     return batches
@@ -975,7 +1561,9 @@ def _confirmation_history(conn, verification_no: str) -> list[dict[str, Any]]:
     for c in confirms:
         crows = conn.execute(
             """SELECT position, batch_no, snapshot_version, snapshot_disposition,
-                      snapshot_actual, snapshot_undeclared, snapshot_reasons
+                      snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                      snapshot_ship_version, snapshot_ship_status,
+                      snapshot_locked_lots, snapshot_ship_reasons
                FROM verification_confirmation_batch
                WHERE confirmation_id = ? ORDER BY position""",
             (c["id"],),
@@ -993,6 +1581,14 @@ def _confirmation_history(conn, verification_no: str) -> list[dict[str, Any]]:
                         "actual_allergens": loads(cr["snapshot_actual"]),
                         "undeclared_allergens": loads(cr["snapshot_undeclared"]),
                         "reasons": loads(cr["snapshot_reasons"]),
+                        "shipment_eligibility": None
+                        if cr["snapshot_ship_version"] is None
+                        else {
+                            "version": cr["snapshot_ship_version"],
+                            "status": cr["snapshot_ship_status"],
+                            "locked_lots": loads(cr["snapshot_locked_lots"]),
+                            "reasons": loads(cr["snapshot_ship_reasons"]),
+                        },
                     }
                     for cr in crows
                 ],
@@ -1016,13 +1612,18 @@ def _verification_payload(conn, row, *, with_history: bool = True) -> dict[str, 
 
 
 def _refresh_snapshots(conn, verification_no: str, batch_nos: list[str]) -> None:
-    """按提交顺序用各批“当前裁决版本与结论”重写逐批快照（草稿/待复核重新核验）。"""
+    """按提交顺序用各批“当前裁决版本与结论、出货资格版本与状态”重写逐批快照
+    （草稿/待复核重新核验）。"""
     now = _now()
     conn.execute("DELETE FROM verification_batch WHERE verification_no = ?", (verification_no,))
     rows = conn.execute(
         f"""SELECT b.batch_no AS batch_no, a.version AS version, a.disposition AS disposition,
-                   a.actual AS actual, a.undeclared AS undeclared, a.reasons AS reasons
-            FROM batch b JOIN adjudication a ON a.batch_no = b.batch_no
+                   a.actual AS actual, a.undeclared AS undeclared, a.reasons AS reasons,
+                   se.version AS ship_version, se.status AS ship_status,
+                   se.locked_lots AS locked_lots, se.reasons AS ship_reasons
+            FROM batch b
+            JOIN adjudication a ON a.batch_no = b.batch_no
+            JOIN shipment_eligibility se ON se.batch_no = b.batch_no
             WHERE b.batch_no IN ({','.join('?' * len(batch_nos))})""",
         batch_nos,
     ).fetchall()
@@ -1032,8 +1633,10 @@ def _refresh_snapshots(conn, verification_no: str, batch_nos: list[str]) -> None
         conn.execute(
             """INSERT INTO verification_batch
                (verification_no, batch_no, position, snapshot_version, snapshot_disposition,
-                snapshot_actual, snapshot_undeclared, snapshot_reasons)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                snapshot_actual, snapshot_undeclared, snapshot_reasons,
+                snapshot_ship_version, snapshot_ship_status,
+                snapshot_locked_lots, snapshot_ship_reasons)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 verification_no,
                 batch_no,
@@ -1043,6 +1646,10 @@ def _refresh_snapshots(conn, verification_no: str, batch_nos: list[str]) -> None
                 a["actual"],
                 a["undeclared"],
                 a["reasons"],
+                a["ship_version"],
+                a["ship_status"],
+                a["locked_lots"],
+                a["ship_reasons"],
             ),
         )
     conn.execute(
